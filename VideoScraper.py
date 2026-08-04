@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+VideoScraper — a best-effort universal video downloader.
+
+Strategy:
+  1. Try yt-dlp (handles thousands of sites natively).
+  2. Fall back to headless Chrome (Selenium) to discover media URLs
+     via DOM inspection and Chrome performance/network logs, then
+     download the best-scored candidate.
+
+Exit codes:
+  0   — success
+  1   — invalid input/configuration error
+  2   — download failed (no candidate worked)
+  130 — interrupted by user (Ctrl+C)
+"""
 
 import argparse
 import json
@@ -37,8 +52,18 @@ MEDIA_MIME_HINTS = (
     "application/dash+xml",
 )
 
+__version__ = "1.1.0"
+
+# --- Tunable defaults ---------------------------------------------------------
+PAGE_LOAD_TIMEOUT = 25             # seconds to wait for document.readyState
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB chunks for direct downloads
+DOWNLOAD_TIMEOUT = 40              # HTTP read timeout for direct downloads
+SCROLL_DELAY = 0.8                 # delay between scroll steps when triggering lazy media
+DEFAULT_RETRIES = 3                # retry attempts for direct HTTP downloads
+
 
 def normalize_url(url: str) -> str:
+    """Validate and normalize a URL, prepending ``https://`` when needed."""
     url = url.strip()
     if not url:
         raise ValueError("URL is empty.")
@@ -55,6 +80,7 @@ def normalize_url(url: str) -> str:
 
 
 def sanitize_filename(name: str, fallback: str = "video") -> str:
+    """Build a filesystem-safe filename from *name*, falling back if empty."""
     name = unquote(name or "").strip()
     name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
     name = re.sub(r"\s+", " ", name).strip(" ._")
@@ -62,6 +88,7 @@ def sanitize_filename(name: str, fallback: str = "video") -> str:
 
 
 def get_url_extension(url: str) -> str:
+    """Return the lowercase media extension of *url*'s path, or ``""`` if none."""
     path = urlparse(url).path.lower()
     for ext in DIRECT_VIDEO_EXTS + STREAM_EXTS:
         if path.endswith(ext):
@@ -70,6 +97,7 @@ def get_url_extension(url: str) -> str:
 
 
 def next_available_path(path: Path) -> Path:
+    """Return *path* if free, otherwise ``name_2``, ``name_3``, … that is free."""
     if not path.exists():
         return path
 
@@ -86,6 +114,7 @@ def next_available_path(path: Path) -> Path:
 
 
 def looks_like_media_url(url: Optional[str], mime: str = "") -> bool:
+    """Heuristically decide whether *url* (with optional *mime*) is a media URL."""
     if not url:
         return False
 
@@ -114,6 +143,7 @@ def looks_like_media_url(url: Optional[str], mime: str = "") -> bool:
 
 
 def score_media_url(url: str) -> int:
+    """Score a media URL by extension and quality hints (higher is better)."""
     lower = url.lower()
     path = urlparse(url).path.lower()
     score = 0
@@ -145,6 +175,7 @@ def score_media_url(url: str) -> int:
 
 
 def unique_sorted(urls: Iterable[str]) -> List[str]:
+    """Deduplicate, filter to plausible media URLs, and sort by score (desc)."""
     cleaned: Set[str] = set()
     for url in urls:
         if not url:
@@ -164,7 +195,9 @@ def try_ytdlp_download(
     quality: str = "best",
     referer: Optional[str] = None,
     quiet: bool = False,
+    verbose: bool = False,
 ) -> bool:
+    """Attempt to download *url* with yt-dlp. Returns ``True`` on success."""
     try:
         import yt_dlp
     except ImportError:
@@ -190,8 +223,8 @@ def try_ytdlp_download(
         "fragment_retries": 5,
         "continuedl": True,
         "merge_output_format": "mp4",
-        "quiet": quiet,
-        "no_warnings": False,
+        "quiet": quiet and not verbose,
+        "no_warnings": not verbose,
         "http_headers": {
             "User-Agent": USER_AGENT,
             **({"Referer": referer} if referer else {}),
@@ -209,6 +242,7 @@ def try_ytdlp_download(
 
 
 def create_chrome_driver(headless: bool = True) -> webdriver.Chrome:
+    """Create a configured Chrome WebDriver with performance logging enabled."""
     options = ChromeOptions()
 
     if headless:
@@ -237,7 +271,8 @@ def create_chrome_driver(headless: bool = True) -> webdriver.Chrome:
     return driver
 
 
-def wait_for_page(driver: webdriver.Chrome, timeout: int = 25) -> None:
+def wait_for_page(driver: webdriver.Chrome, timeout: int = PAGE_LOAD_TIMEOUT) -> None:
+    """Wait until the page reaches at least ``interactive`` readiness."""
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script("return document.readyState") in {"interactive", "complete"}
     )
@@ -245,6 +280,7 @@ def wait_for_page(driver: webdriver.Chrome, timeout: int = 25) -> None:
 
 
 def collect_dom_media_urls_in_current_frame(driver: webdriver.Chrome) -> Set[str]:
+    """Collect media URLs from the current frame's DOM (video/source/attributes)."""
     urls: Set[str] = set()
 
     # <video src="..."> and video.currentSrc
@@ -299,6 +335,7 @@ def collect_dom_media_urls_in_current_frame(driver: webdriver.Chrome) -> Set[str
 
 
 def collect_dom_media_urls(driver: webdriver.Chrome, max_depth: int = 3) -> Set[str]:
+    """Recursively collect media URLs from the page and nested iframes."""
     urls: Set[str] = set()
 
     def scan_frame(depth: int) -> None:
@@ -330,6 +367,7 @@ def collect_dom_media_urls(driver: webdriver.Chrome, max_depth: int = 3) -> Set[
 
 
 def collect_network_media_urls(driver: webdriver.Chrome) -> Set[str]:
+    """Extract media URLs from Chrome's performance/network logs."""
     urls: Set[str] = set()
 
     try:
@@ -367,10 +405,7 @@ def collect_network_media_urls(driver: webdriver.Chrome) -> Set[str]:
 
 
 def gently_trigger_video_loading(driver: webdriver.Chrome) -> None:
-    """
-    This does not bypass anything. It just asks already-present video elements to load/play muted,
-    and scrolls the page so lazy-loaded players can appear.
-    """
+    """Mute/load/play present video elements and scroll to surface lazy-loaded players."""
     try:
         driver.execute_script(
             """
@@ -391,7 +426,7 @@ def gently_trigger_video_loading(driver: webdriver.Chrome) -> None:
         height = driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);")
         for y in (0, height // 3, (height * 2) // 3, height):
             driver.execute_script("window.scrollTo(0, arguments[0]);", y)
-            time.sleep(0.8)
+            time.sleep(SCROLL_DELAY)
         driver.execute_script("window.scrollTo(0, 0);")
     except Exception:
         pass
@@ -401,13 +436,15 @@ def discover_media_urls_with_selenium(
     page_url: str,
     wait_seconds: int = 8,
     headless: bool = True,
+    timeout: int = PAGE_LOAD_TIMEOUT,
 ) -> List[str]:
+    """Open *page_url* in Chrome and return discovered, score-sorted media URLs."""
     driver = create_chrome_driver(headless=headless)
 
     try:
         print("🌐 Opening page with Selenium...")
         driver.get(page_url)
-        wait_for_page(driver)
+        wait_for_page(driver, timeout=timeout)
 
         gently_trigger_video_loading(driver)
         time.sleep(wait_seconds)
@@ -425,6 +462,7 @@ def discover_media_urls_with_selenium(
 
 
 def build_output_path(page_url: str, media_url: str, out_dir: Path) -> Path:
+    """Build a non-clobbering output path for a media URL, defaulting to ``.mp4``."""
     parsed_page = urlparse(page_url)
     parsed_media = urlparse(media_url)
 
@@ -440,7 +478,13 @@ def build_output_path(page_url: str, media_url: str, out_dir: Path) -> Path:
     return next_available_path(out_dir / f"{media_slug}{ext}")
 
 
-def download_direct_file(media_url: str, out_path: Path, referer: Optional[str] = None) -> bool:
+def download_direct_file(
+    media_url: str,
+    out_path: Path,
+    referer: Optional[str] = None,
+    retries: int = DEFAULT_RETRIES,
+) -> bool:
+    """Download a direct video file with retry support. Returns ``True`` on success."""
     headers = {
         "User-Agent": USER_AGENT,
         **({"Referer": referer} if referer else {}),
@@ -452,29 +496,39 @@ def download_direct_file(media_url: str, out_path: Path, referer: Optional[str] 
     print(media_url)
     print(f"💾 Saving as: {out_path}")
 
-    try:
-        with requests.get(media_url, headers=headers, stream=True, timeout=40) as response:
-            response.raise_for_status()
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            with requests.get(
+                media_url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT
+            ) as response:
+                response.raise_for_status()
 
-            total = int(response.headers.get("content-length", 0))
-            with open(out_path, "wb") as file, tqdm(
-                total=total,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc="📥 Progress",
-            ) as bar:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        file.write(chunk)
-                        bar.update(len(chunk))
+                total = int(response.headers.get("content-length", 0))
+                with open(out_path, "wb") as file, tqdm(
+                    total=total,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc="📥 Progress",
+                ) as bar:
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        if chunk:
+                            file.write(chunk)
+                            bar.update(len(chunk))
 
-        print("✅ Download complete.")
-        return True
+            print("✅ Download complete.")
+            return True
 
-    except Exception as exc:
-        print(f"❌ Direct download failed: {exc}")
-        return False
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if attempt < retries:
+                print(f"⚠️ Attempt {attempt}/{retries} failed: {exc} — retrying...")
+                time.sleep(2 * attempt)
+            else:
+                print(f"❌ Direct download failed after {retries} attempt(s): {exc}")
+
+    return False
 
 
 def download_best_candidate(
@@ -483,7 +537,10 @@ def download_best_candidate(
     out_dir: Path,
     quality: str = "best",
     list_only: bool = False,
+    retries: int = DEFAULT_RETRIES,
+    verbose: bool = False,
 ) -> bool:
+    """List candidates and download the best one. Returns ``True`` on success."""
     if not candidates:
         print("❌ No downloadable media URL found.")
         return False
@@ -503,13 +560,16 @@ def download_best_candidate(
 
     if ext in STREAM_EXTS:
         print("📡 Stream detected. Using yt-dlp for HLS/DASH download...")
-        return try_ytdlp_download(chosen, out_dir, quality=quality, referer=page_url)
+        return try_ytdlp_download(
+            chosen, out_dir, quality=quality, referer=page_url, verbose=verbose
+        )
 
     out_path = build_output_path(page_url, chosen, out_dir)
-    return download_direct_file(chosen, out_path, referer=page_url)
+    return download_direct_file(chosen, out_path, referer=page_url, retries=retries)
 
 
 def main() -> int:
+    """Parse CLI args and run the two-stage download pipeline."""
     parser = argparse.ArgumentParser(
         description="Best-effort universal video downloader for authorized downloads."
     )
@@ -529,6 +589,10 @@ def main() -> int:
     parser.add_argument("--list-only", action="store_true", help="Only list discovered media URLs, do not download")
     parser.add_argument("--headful", action="store_true", help="Show browser window instead of headless mode")
     parser.add_argument("--wait", type=int, default=8, help="Extra seconds to wait for lazy-loaded media")
+    parser.add_argument("--timeout", type=int, default=PAGE_LOAD_TIMEOUT, help="Page-load timeout in seconds")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retry attempts for direct HTTP downloads")
+    parser.add_argument("--verbose", action="store_true", help="Show yt-dlp warnings and extra debug output")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
 
@@ -545,35 +609,43 @@ def main() -> int:
     print(f"🔗 URL: {page_url}")
     print("⚠️ Use only where you have permission. DRM/paywall/login bypass is not supported.\n")
 
-    # Step 1: yt-dlp handles thousands of sites and many generic video pages.
-    if not args.no_ytdlp and not args.list_only:
-        if try_ytdlp_download(page_url, out_dir, quality=args.quality):
-            print("✅ Finished with yt-dlp.")
+    try:
+        # Step 1: yt-dlp handles thousands of sites and many generic video pages.
+        if not args.no_ytdlp and not args.list_only:
+            if try_ytdlp_download(page_url, out_dir, quality=args.quality, verbose=args.verbose):
+                print("✅ Finished with yt-dlp.")
+                return 0
+
+        # Step 2: Selenium fallback.
+        candidates = discover_media_urls_with_selenium(
+            page_url,
+            wait_seconds=args.wait,
+            headless=not args.headful,
+            timeout=args.timeout,
+        )
+
+        if download_best_candidate(
+            page_url,
+            candidates,
+            out_dir,
+            quality=args.quality,
+            list_only=args.list_only,
+            retries=args.retries,
+            verbose=args.verbose,
+        ):
             return 0
 
-    # Step 2: Selenium fallback.
-    candidates = discover_media_urls_with_selenium(
-        page_url,
-        wait_seconds=args.wait,
-        headless=not args.headful,
-    )
+        print("\n❌ Could not download this video.")
+        print("Possible reasons:")
+        print("- The site uses DRM/encrypted media.")
+        print("- The video requires login or paid access.")
+        print("- The stream URL is generated after manual interaction.")
+        print("- The website blocks automated browsers.")
+        return 2
 
-    if download_best_candidate(
-        page_url,
-        candidates,
-        out_dir,
-        quality=args.quality,
-        list_only=args.list_only,
-    ):
-        return 0
-
-    print("\n❌ Could not download this video.")
-    print("Possible reasons:")
-    print("- The site uses DRM/encrypted media.")
-    print("- The video requires login or paid access.")
-    print("- The stream URL is generated after manual interaction.")
-    print("- The website blocks automated browsers.")
-    return 2
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted by user.")
+        return 130
 
 
 if __name__ == "__main__":
